@@ -1,0 +1,146 @@
+name: Scrape Google Maps (établissements)
+
+on:
+  # Lancement manuel depuis l'onglet "Actions" de GitHub, avec paramètres réglables
+  workflow_dispatch:
+    inputs:
+      nb_onglets:
+        description: "Nombre d'onglets en parallèle"
+        required: false
+        default: "2"
+      pause_min:
+        description: "Pause minimale entre deux URLs (secondes)"
+        required: false
+        default: "2.0"
+      pause_max:
+        description: "Pause maximale entre deux URLs (secondes)"
+        required: false
+        default: "4.0"
+      commit_toutes_les:
+        description: "Commit Git tous les N URLs traitées"
+        required: false
+        default: "20"
+  # Optionnel : décommente pour un lancement automatique programmé
+  # schedule:
+  #   - cron: "0 3 * * *"   # tous les jours à 3h UTC
+
+# Nécessaire pour que la dernière étape puisse committer/pusher et déclencher
+# un nouveau run du workflow (gh workflow run) avec le token par défaut.
+permissions:
+  contents: write
+  actions: write
+
+# Empêche deux runs de tourner en même temps (le run auto-relancé attend
+# que le précédent soit complètement terminé, y compris son commit final,
+# avant de démarrer) : évite les conflits git et le double traitement.
+concurrency:
+  group: scrape-maps
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Filet de sécurité : coupe le job s'il bloque (captcha en boucle, page
+    # figée) au lieu de laisser tourner jusqu'à la limite max de 6h.
+    # Un nouveau run est automatiquement relancé à la fin s'il reste des URLs
+    # à traiter (voir la dernière étape) — pas besoin d'augmenter cette valeur.
+    timeout-minutes: 90
+
+    # Les inputs ne sont disponibles que sur un déclenchement manuel ; on met
+    # des valeurs par défaut pour les autres cas (ex: schedule).
+    env:
+      NB_ONGLETS: ${{ github.event.inputs.nb_onglets || '2' }}
+      PAUSE_MIN: ${{ github.event.inputs.pause_min || '2.0' }}
+      PAUSE_MAX: ${{ github.event.inputs.pause_max || '4.0' }}
+      GIT_COMMIT_TOUTES_LES: ${{ github.event.inputs.commit_toutes_les || '20' }}
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        timeout-minutes: 8
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      # Le script commit + push lui-même tous les GIT_COMMIT_TOUTES_LES URLs
+      # (voir commit_git() dans scrape_google_maps.py), il a donc besoin de
+      # l'identité git configurée AVANT de démarrer.
+      - name: Configurer git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Lancer le script
+        run: python scrape_google_maps.py
+
+      # Sauvegarde les résultats + l'état d'avancement (urls.csv mis à jour),
+      # même si le job est interrompu.
+      - name: Uploader les résultats (toujours, même en cas d'échec)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultats-scraping
+          path: |
+            resultats.csv
+            urls.csv
+          if-no-files-found: ignore
+
+      # Filet de sécurité : le script commit déjà tous les N URLs en cours
+      # de route. Cette étape ne rattrape que le dernier lot restant (< N
+      # URLs) si le job s'arrête avant d'atteindre le prochain palier.
+      - name: Commit final (rattrape le dernier lot restant)
+        if: always()
+        run: |
+          git add urls.csv resultats.csv || true
+
+          if git diff --staged --quiet; then
+            echo "Rien de nouveau à committer."
+          else
+            git commit -m "Mise à jour résultats scraping [skip ci]"
+            git push
+          fi
+
+      # S'exécute même si le job a été tué par timeout-minutes (le job reçoit
+      # un signal d'annulation mais les étapes if:always() ont un court délai
+      # pour s'exécuter quand même). Le script lit urls.csv directement sur le
+      # disque (déjà à jour ligne par ligne, indépendamment de la fréquence des
+      # commits git) : s'il reste des URLs sans statut "traité"/"échec", on
+      # déclenche un nouveau run du même workflow, qui reprendra automatiquement
+      # là où celui-ci s'est arrêté (le script ne retraite jamais une URL déjà
+      # marquée).
+      - name: Relancer automatiquement s'il reste des URLs à traiter
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RESTANTES=$(python3 -c "
+          import csv, os
+          if not os.path.exists('urls.csv'):
+              print(0)
+          else:
+              with open('urls.csv', encoding='utf-8-sig') as f:
+                  lignes = [l for l in f.read().splitlines() if l.strip()]
+              if not lignes:
+                  print(0)
+              elif lignes[0].strip().lower().startswith('http'):
+                  print(len(lignes))
+              else:
+                  reader = csv.DictReader(lignes)
+                  restantes = sum(1 for r in reader if not (r.get('statut') or '').strip())
+                  print(restantes)
+          ")
+          echo "URLs restantes à traiter : $RESTANTES"
+
+          if [ "$RESTANTES" -gt 0 ]; then
+            echo "Relance automatique du workflow pour continuer..."
+            gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}"
+          else
+            echo "Toutes les URLs ont été traitées, pas de relance nécessaire."
+          fi
